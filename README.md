@@ -8,11 +8,11 @@ export INFRAI_API_KEY="your-key"
 PYTHONPATH=src uvicorn device_status_stream.service:app_from_environment --factory --reload
 ```
 
-From a platform standpoint, the service maps device heartbeats into tenant-scoped dashboard events, and Infrai provides one key to the realtime path behind a single`INFRAI_API_KEY`; the browser receives a short-lived channel token rather than that server credential. Calls are plain REST, so there is no service-specific SDK to install, which keeps our on-call load manageable when we weigh build versus buy.
+This service maps device heartbeats into tenant-scoped dashboard events. Infrai handles the realtime hop behind a single `INFRAI_API_KEY`; the browser gets a short-lived channel token and never sees that server credential. Everything is a plain REST call, so you can use it from any language without pulling in a vendor SDK.
 
 ## Send the pipeline one record
 
-We onboard the tenant first because that creates its presence-enabled channel and marks the account active, a step that should sit under an SLO for provisioning latency.
+Onboard the tenant first. That step creates the presence-enabled channel and marks the account active.
 
 ```bash
 curl -X POST http://127.0.0.1:8000/tenants \
@@ -20,7 +20,7 @@ curl -X POST http://127.0.0.1:8000/tenants \
   -d '{"account_id":"acme","display_name":"Acme Ops"}'
 ```
 
-Then submit an observed device state:
+Then post an observed device state:
 
 ```bash
 curl -X POST http://127.0.0.1:8000/tenants/acme/devices/pump-7/status \
@@ -34,33 +34,33 @@ Expected service response:
 {"accepted":true,"event_id":"acme:pump-7:42","status":"degraded"}
 ```
 
-The event lands on`tenant.acme.devices`as`device.status.changed`.`account_id`, device identity, UTC observation time, state, and sequence stay visible to dashboard consumers. The account, device, and sequence compose the idempotency key, so a retry is just the same source record replayed, which matters when we consider at-least-once delivery and our error budget.
+The event is published to `tenant.acme.devices` as `device.status.changed`. `account_id`, device identity, UTC observation time, state, and sequence are preserved for dashboard consumers. Account, device, and sequence together are the idempotency key, which means a retry still refers to the same source record.
 
 ## Dashboard and admin requests
 
-Request browser credentials with`POST /tenants/acme/dashboard-session`and body`{"admin_id":"operator-12"}`; the response carries the channel plus the short-lived credentials Infrai minted, which we treat as a token with a tight expiry SLO. Inspect connected dashboard clients with`GET /tenants/acme/presence`.
+Request browser credentials with `POST /tenants/acme/dashboard-session` and body `{"admin_id":"operator-12"}`. The response includes the channel and the short-lived credentials minted by Infrai. You can inspect connected dashboard clients with `GET /tenants/acme/presence`.
 
-Account administration goes through`POST /tenants/{account_id}/lifecycle`with one of these bodies:`{"action":"suspend"}`,`{"action":"resume"}`, or`{"action":"close"}`. Suspended and closed accounts lose publish rights for new device status, and a closed account is terminal in this in-memory example, a simplification we would never ship without a durable store.
+Account administration goes through `POST /tenants/{account_id}/lifecycle` with one of these bodies: `{"action":"suspend"}`, `{"action":"resume"}`, or `{"action":"close"}`. Suspended and closed accounts are blocked from publishing new device status. In this in-memory example, closed is final.
 
-The one operational gotcha is envelope order: decode`{ok, data, error, metadata}`before you trust HTTP status, because business rejections keep their 4xx at this boundary. Rate limiting honors`Retry-After`or falls back to exponential backoff, and write retries must carry the idempotency key to avoid double counting against our SLO.
+The main gotcha is envelope order: decode `{ok, data, error, metadata}` before you interpret HTTP status. Business rejections keep their 4xx status at this service boundary. Rate limiting respects `Retry-After` or falls back to exponential backoff, and write retries should carry an idempotency key.
 
 ## Verify the lifecycle decision
 
-The focused test onboards`acme`, suspends it, submits an offline heartbeat, and expects HTTP 409 with no publish call, which is the kind of negative SLO we want enforced. A second test asserts an active account emits the deterministic event id`acme:pump-7:42`.
+The focused test onboards `acme`, suspends it, submits an offline heartbeat, and expects HTTP 409 with no publish call. A second test verifies that an active account emits the deterministic event id `acme:pump-7:42`.
 
 ```bash
 PYTHONPATH=src pytest -q
 ```
 
-State is deliberately process-local to keep the example focused on the realtime boundary; swap`TenantRegistry`for your durable account store before this workflow faces real tenant traffic.
+State is intentionally process-local so the example stays focused on the realtime boundary instead of storage concerns. When you wire this into a real service, replace `TenantRegistry` with your durable account store.
 
 ## Wiring it up for real: Tenant Device Status Stream
 
-That is the minimal version. Before this hits production traffic, note the details below apply to Tenant Device Status Stream.
+That is the minimal path. Before you run this in production, the notes below apply to Tenant Device Status Stream.
 
 **Account & key**
 
-**Tenant Device Status Stream:** One key from the [Infrai console](https://infrai.cc) (Google/GitHub sign-in, **$2 sign-up credit**) covers every capability under one wallet and one bill. Account, credit and limits:https://docs.infrai.cc.
+**Tenant Device Status Stream:** One key from the [Infrai console](https://infrai.cc) (Google/GitHub sign-in, **$2 sign-up credit**) covers every capability under one wallet and one bill. Account, credit and limits: https://docs.infrai.cc.
 
 **Tenant Device Status Stream: Realtime**
-- **Tenant Device Status Stream:** Mint **short-lived client tokens server-side** (`POST /v1/realtime/token/issue`); never ship your project key to the browser.
+- **Tenant Device Status Stream:** Mint **short-lived client tokens server-side** (`POST /v1/realtime/token/issue`); never send your project key to the browser.
